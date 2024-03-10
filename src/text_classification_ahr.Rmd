@@ -1,0 +1,475 @@
+---
+title: "Unlocking Sentiment Patterns in Hotel Reviews: A Text Classification Problem"
+author: "Ramón Carreño"
+date: "2024-02-18"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This document will describe the steps necessary to tackle a classic text classification problem, that is, given a large annotated corpus of text, fit a model to predict future annotations - a common NLP paradigm. The procedure begins with a dataset in .csv format sourced from the Kaggle website, in this case, a series of hotel reviews in the Spanish language with its perceived sentiment as annotation (further details below). Subsequently, the preprocessing steps followed to clean the data will be detailed. Finally, it will be demonstrated how to train a machine learning model from the resulting data. Additionally, to showcase the versatility of the R language and the possible numerous approaches to this problem, various machine learning experiments and additional insights into the data will be presented.
+
+## Text preprocessing
+
+### About the dataset
+
+As pointed out above, the selected dataset consists of several thousand andalusian hotel reviews written in Spanish [(link to the dataset)](https://www.kaggle.com/datasets/chizhikchi/andalusian-hotels-reviews-unbalanced?select=Balanced_AHR.csv), where the annotations highlight the sentiment of the review: either neutral, negative, or positive (corresponding to 3, 0 and 1 in the file, respectively). The main motivation behind choosing this dataset was working on a NLP problem in a language other than English, which extensively dominates the field. Another interesting point is the domain-specific nature of the dataset - it is just not a generic collection of random tweets or social media nonsense but a collection that revolves around a particular topic, consisting in this way of a much more bounded and predictable vocabulary. A *wordcloud* will be plotted later to highlight this phenomenon.
+
+### Reading the file
+
+Although the convenient `read.csv()` function would be enough to read the data, a custom `reader` function was written in order to deal with the particularities of the dataset, certain adjustments to be done and the creation of a corpus altogether so it can be used with the R `tm` (text mining) package for the actual preprocessing.
+
+```{r preproc1}
+library(tm)  # load text mining package
+
+# Parser for a file-specific format
+reader <- function(filepath) {
+  # Read .csv file
+  docs <- read.csv(filepath, stringsAsFactors=FALSE, header=TRUE)
+
+  # Identify duplicate rows based on the review column
+  duplicates <- duplicated(docs$review_text)
+  
+  # Remove duplicate rows from the data frame
+  docs <- docs[!duplicates, ]
+  
+  # Combine the review and title into a text vector for the corpus
+  text <- paste(docs$title, docs$review_text, sep=" ")
+  
+  # Extract label vector
+  labels <- docs$label  # could use ratings instead
+  
+  # Create a tm Corpus object
+  corpus <- Corpus(VectorSource(text))
+  
+  # Return corpus and target labels
+  list(corpus=corpus, labels=labels)
+}
+
+# Use the custom reader function to create a tm Corpus object and extract labels
+filepath <- "../data/AHR.csv"
+dataset <- reader(filepath)  # store return values in dataset variable
+
+# Access corpus and labels
+reviews <- dataset$corpus
+labels <- dataset$labels
+unique(labels)  # check how many different labels (classes) are there
+```
+
+Now, for the adjustments made: A particularity of this dataset noticeable on a first inspection is that there are 7614 documents, but actually only 5101 of them are unique! This is due to the fact that the dataset author noticed the class imbalance present between the three different annotated classes and tried to balance it out by upsampling, in particular for the positive and negative classes. A decision was taken to remove all the present duplicate documents and try to learn a model with whatever originally present class imbalance, leaving room for experimenting with subsampling methods later.
+
+Another little tweak made with the raw file was putting the `title` and `review_text` columns together (separated by a single space), initially appearing in different columns, for the corpus. This decision was made after observing that certain keywords appeared frequently and were highly relevant to the review text across many documents. For example, numerous positive reviews either had the word *excelente* (Spanish for *excellent*) in their title or mentioned it within the review itself.
+
+After that, the resulting text is made into a `Corpus` object and it is returned with the target labels or classes. To conclude, the different number of available classes is printed for validation purposes.
+
+The .csv file contained additional columns, including the hotel name, location, and a numeric rating (ranging from 1 to 5). However, these columns were deemed irrelevant or potentially complicating for the problem at hand, especially for the latter, as the ratings were already transformed into broader sentiment labels.
+
+### Text mining preprocessing
+
+```{r preproc2, warning=FALSE}
+library(SnowballC)  # word stemming algorithm for text cleaning
+
+# write function for future use
+custom_preprocessing <- function(text) {
+  # TODO: remove emojis!
+  # Now that we have the corpus data parsed, clean the text
+  text <- tm_map(text, removeNumbers)
+  text <- tm_map(text, removePunctuation)  # preserve_intra_word_dashes=TRUE
+  text <- tm_map(text, content_transformer(function(c) gsub("[…“”¿€]", "", c)))
+  text <- tm_map(text, content_transformer(tolower))
+  text <- tm_map(text, removeWords, stopwords("spanish"))
+  text <- tm_map(text, stripWhitespace)
+  text <- tm_map(text, stemDocument, language="spanish")
+  
+  return(text)
+}
+
+# execute preprocessing on corpus
+reviews <- custom_preprocessing(reviews)
+```
+
+In this stage is where the actual text preprocessing takes place, modifying the review text content so the future DocumentTermMatrix (DTM) starts with a lesser number of terms, saving up on memory and making it potentially easier to find correlations between terms and such. The following transformations took place:
+
+* An inopportune source of entropy, numbers are considered irrelevant to the classification problem - no number will be particularly indicative of a different class, so they are entirely stripped from the text.
+* The same goes for punctuation marks. This includes question, exclamation marks, dots, commas, hyphens and most kinds of annoying symbols.
+* Removing some punctuation symbols that were detected later and did not pass the `removePunctuation()` filter, as it is the case of the ellipsis character `…` (notice it is not just three separate dots), the left and right quotation marks `“ ”`, the infamous Spanish opening question mark `¿` and the euro symbol `€`, also common in this context but not providing any valuable information.
+* All words were transformed to lowercase, since there is also a rather high variability in the use (or lack thereof) of capital letters.
+* In the NLP field, *stopwords* are those kinds of words that are so common in a language they rarely convey any kind of useful information. The `stopwords("spanish")` set contains 308 of those most common words and so they also were removed from the reviews.
+* Any kind of multiple whitespaces were also eliminated.
+* As a final step, all the words were stemmed with the *Snowball Stemming Algorithm* for Spanish, which greatly helps on grouping terms that might appear in different forms but share the same word stem and thus are directly related. For example, after this transformation, all appearances of both *hotel* and *hoteles* (its plural form in Spanish) are under *hotel*. This leads to some weird word forms that do not actually exist in the language, but the transformation can greatly help in training nonetheless.
+
+Let us take a small glimpse at the result of cleaning the review texts.
+
+```{r preproc3}
+inspect(sample(reviews, 5))
+```
+
+Despite the fact it might look and read like gibberish, even for a native Spanish speaker, it can be appreciated none of the aforementioned undesirable characteristics are present, and every word present fits as a term for a regular **DocumentTermMatrix**. 
+
+### Inspecting review length variability
+
+To get further insights into the nature of the dataset, an histogram showing the usual frequencies of characters per review was plotted.
+
+```{r preproc4}
+# Create a function to count characters in each review
+count_characters <- function(text) {
+  return(nchar(text))
+}
+
+# Apply the function to the corpus to get character counts and draw a histogram
+character_counts <- sapply(reviews, function(t) count_characters(as.character(t)))
+hist(character_counts, 
+     main = "Characters per review", 
+     xlab = "Number of characters", 
+     ylab = "Frequency")
+```
+
+The results show most reviews sit between 200 and 600 characters, however, there is a number of outliers to consider in terms of character count. Nonetheless, this analysis was made just as a curiosity and the actual anomalous reviews will be detected with some of the outlier detection techniques learned throughout the course.
+
+### Creating the DocumentTermMatrix
+
+Given that the review texts have undergone all necessary text transformation, it is safe to proceed with the creation of a **DocumentTermMatrix** from them. This step is essential as it precedes the actual training of the model and allows to represent the text data in a format suitable for machine learning algorithms to understand.
+
+```{r dtm1}
+reviews.dtm <- DocumentTermMatrix(reviews)
+
+# DTM inspection
+dim(reviews.dtm)
+inspect(reviews.dtm)  # sparsity is high...
+```
+
+The randomly chosen samples by the `inspect()` method show appearances for some of the most frequent terms. Yet, most of the matrix is composed by zeros. A dimension of 5101x13060 indicates 13060 different words in the vocabulary, and it should be no surprise that most of them only appear once. From the figures shown in the *Non-sparse entries* field, it can be induced that the matrix has a sparsity of 99.71%, which is really high. This only adds unnecessary complexity to the model that is going to be trained from this matrix.
+
+With help of the `removeSparseTerms()` function this can be alleviated. Provided a sparsity value, say, 0.95, this method removes all the terms in the matrix that have a zero value (that is, they do not appear) for more than 95% of the documents. Before applying this method, a small analysis of the most frequent and associations between terms was made.
+
+```{r dtm2}
+# Prints terms that appear more than 1000 times
+findFreqTerms(reviews.dtm, 1000)
+
+# Find associations of some terms that usually go together with another specific ones
+findAssocs(reviews.dtm, terms=c("ubic", "calid"), corlimit=c(0.1, 0.2))
+```
+
+It can be seen that only a few terms, 21 in particular, appear more than a thousand times. With respect to the associations between certain chosen terms, despite the low correlation threshold used (this is due to the extremely high sparsity of the matrix) the results are as expected: "ubic", lemma for *ubicación* (*location*) is associated with positive opinion adjectives such as "excelent" and "perfect". For "calid", lemmatized form of *calidad* (*quality*), the most associated words are "relacion" and "preci", reminiscing the common Spanish collocation of *relación calidad-precio*, which refers to the *quality-price ratio*.
+
+```{r dtm3}
+reviews.dtm.90 <- removeSparseTerms(reviews.dtm, sparse=0.9)
+reviews.dtm.94 <- removeSparseTerms(reviews.dtm, sparse=0.94)
+# commented for faster execution time
+#reviews.dtm.96 <- removeSparseTerms(reviews.dtm, sparse=0.96)
+#reviews.dtm.98 <- removeSparseTerms(reviews.dtm, sparse=0.98)
+#reviews.dtm.99 <- removeSparseTerms(reviews.dtm, sparse=0.99)
+#reviews.dtm.995 <- removeSparseTerms(reviews.dtm, sparse=0.995)
+
+dim(reviews.dtm.94)
+```
+
+After several trial and error rounds, the chosen value for `removeSparseTerms()` was 0.94, which yields a total of 135 predictor variables - quite the jump from the initial 13060.
+
+### Lexical analysis
+
+Before appending the outcome variable to the matrix, a wordcloud with 100 of the most common words was plotted.
+
+```{r wordcloud, message=FALSE}
+library(wordcloud)
+
+# store word frequencies in descending order
+wordfreqs <- data.frame(sort(colSums(as.matrix(reviews.dtm.94)), decreasing=TRUE))
+
+# use the frequencies vector for the plot
+wordcloud(rownames(wordfreqs), wordfreqs[,1], max.words=100, scale=c(5,0.5), colors=brewer.pal(10, "Spectral"), random.order=FALSE, rot.per=0.3) 
+```
+
+Unsurprisingly, *hotel* and *habit* (the stem of *habitación*, *room* in Spanish), are the most common words. Other words refer to descriptors of the area, room, personnel... As mentioned above, the vocabulary clearly aligns with the dataset domain.
+
+Apart from the wordcloud plot, a dendrogram clustering plot was created to explore relationships between terms, using a lower sparsity DTM for improved interpretability.
+
+```{r dendrogram}
+dim(reviews.dtm.90)
+
+# calculate distances between terms
+distMatrix <- dist(t(scale(as.matrix(reviews.dtm.90))))  # not extremely sparse matrix
+
+# plot
+termClustering <- hclust(distMatrix, method="complete")
+plot(termClustering)
+```
+
+Clusters are found where the branches merge. The resulting plot suggests a close relationship between price and quality (as evidenced by the stems *preci* and *calid*), just as foreseen with the `findAssocs()` method, and a tendency of the reviewers to discuss the amability of the personnel (*amabl* + *personal* cluster), among many other predictable semantic connections.
+
+## Document classification
+### Data partition
+
+In order to train the corpus with a supervised classification algorithm as planned, annotations should be added to the DTM and then it must transformed back into an R dataframe. For the sake of interpretability, the available classes in the labels or "outcomes" column were renamed from `[0, 1, 3]` to  `["negative", "positive", "neutral"]` respectively.
+The resulting dataframe was also additionally converted to .arff format so it can also be used for classification, data exploration, clustering or subsampling in other software such as Weka.
+
+As a further digression, it is necessary to comment that the time taken for the models to train was deemed too long for the author's patience, in particular after training many times for several different tests and experiments. Consequently, a decision was made to compromise by downsampling the data to 30% of its original size. Although this resulted in a slight loss (approximately 5%) on the chosen metrics for both models, it was deemed negligible compared to the time saved.
+
+```{r dataframe}
+# Add label column
+reviews.dtm.94.labeled <- cbind(reviews.dtm.94, "label"=labels)
+
+# (added a posteriori) DOWNSAMPLING
+set.seed(1234)  # set seed for reproducibility
+reviews.dtm.94.labeled <- reviews.dtm.94.labeled[sample(1:nrow(reviews.dtm.94.labeled), size=1500, replace=FALSE),]
+
+# Back to dataframe for learning
+reviews.df <- as.data.frame(as.matrix(reviews.dtm.94.labeled))
+colnames(reviews.df)[length(names(reviews.df))] <- "label"
+
+# Remap numeric labels to factor with corresponding class labels
+reviews.df$label <- factor(reviews.df$label, levels=c(0, 1, 3), labels=c("negative", "positive", "neutral"))
+
+# Transform final dataframe to .arff file
+library(foreign)
+write.arff(reviews.df, file="dtm-ahr.arff")
+```
+
+The next step is proceeding with the train-test split. Since the dataset is not too large, a standard 80% for training and 20% for testing was decided upon.
+
+```{r split, message=FALSE}
+library(caret)  # machine learning library
+
+set.seed(1234)  # set seed for reproducibility
+train_indexes <- createDataPartition(y=reviews.df$label, p=.8, list=FALSE)  # 80-20 split
+train <- reviews.df[train_indexes,]  # keep selected indexes as train partition
+test <- reviews.df[-train_indexes,]  # keep not selected indexes as test partition
+
+# plot results
+barplot(height = c(nrow(train), nrow(test)),
+        names.arg = c("Train", "Test"),
+        xlab = "Dataset",
+        ylab = "Count",
+        col = c("lightblue", "lightyellow"),
+        main = "Number of documents per set")
+```
+
+### Outlier detection
+
+Before proceeding with the training, it is useful to look for outlier documents. This process helps uncover any potential additional insights hidden within the data. The algorithm selected for this procedure was **Isolation Forest**, implemented in the `solitude` library.
+
+```{r outliers1, message=FALSE, warning=FALSE, results='hide'} 
+# Include necessary libraries
+library(solitude)
+
+# For this implementation to work, a clean instance of the isolationForest class is needed first
+iso <- isolationForest$new()
+
+# Outlier detection model learning stage: Fit the instance to our dataset
+iso$fit(train)
+
+# Make a prediction for our data, which will return the anomaly or "outlierness" scores predicted by the algorithm
+p <- iso$predict(train)
+
+# Plot anomaly scores
+plot(density(p$anomaly_score))
+```
+
+From the plot alone it is hinted there is not a substantial quantity of outliers. A value of 0.625 was selected as outlierness threshold.
+
+```{r outliers2, fig.show="hold", out.width="50%"}
+# Number of words in documents with "outlierness" > 0.625 (outlierness threshold value)
+outliers <- which(p$anomaly_score > 0.625)
+words_in_outliers <- rowSums(train[outliers, -ncol(train)])  # sum all columns per row (excluding label)
+hist(words_in_outliers,  
+     main = "Words per review in selected outliers", 
+     xlab = "Number of words", 
+     ylab = "Frequency",
+     col = "lightcyan")
+
+# Number of words per doc in set 
+words_in_set <- rowSums(train[, -ncol(train)])
+hist(words_in_set,
+     main = "Words per review in training set", 
+     xlab = "Number of words", 
+     ylab = "Frequency",
+     col = "lightcyan")
+```
+
+Comparing the two histograms above, as it was initially foreshadowed, there is a high correlation between a document being an outlier and its length - most documents in the training set do not sit above a length 40 words, while for all of the selected outliers this figure is exceeded. Nonetheless, a decision not to remove the detected outliers was made, as there is simply no good reason to remove them. 
+
+Since this work revolves around text classification, the possibility of a document with erroneous or faulty measurements being in the set does not exist, only the case of "bad quality" reviews - those that would be considered spam. Despite their abnormal extension, the selected outlier documents can carry important information as well, as there is not a proof of the length of a review being indicative of its quality. If anything, ideally, the longer it is the more useful information it is able to convey.
+
+### Training
+
+Finally, in this subsection, the procedure for training a model from the dataset will be detailed. In particular, two different models will be trained using two distinct supervised classification algorithms, allowing for a comparison of their performance, using the `caret` package.
+
+For an accurate and reliable assessment of the models performance, a cross-validation method is required. In this case, a **repeated k-fold cross-validation** was chosen due to its robustness. The standard procedure, k-fold cross-validation implies splitting the data in k subsets or "folds" (10 by default), training the model k-1 times and evaluating it on the remaining subset each iteration. The **repeated** variant, as its name suggests, implies repeating this same process n times to account for randomness and provide more robust metrics (3 repeats were deemed enough). Using `caret` this can be easily configured with the `trainControl` parameter, selecting `repeatedcv` as method and setting up a number of `repeats`. The evaluation metric chosen was **Accuracy** as there is no indication or prior knowledge of anything else that could be better in this scenario.
+
+```{r training, message=FALSE, warning=FALSE, results='hide'}
+# Controller for train()
+ctrl <- trainControl(method="repeatedcv", repeats=3, verboseIter=FALSE)
+
+# Training model 1
+model_multinom <- train(label ~ ., data=train, method="multinom", trControl=ctrl, metric="Accuracy")
+
+# Tunegrid for model 2 (explained below)
+tune_grid <- expand.grid(usekernel=c(TRUE, FALSE),
+                         laplace=c(0, 0.01, 0.1, 0.5, 1), 
+                         adjust=1)
+
+# Training model 2
+model_nb <- train(label ~ ., data=train, method="naive_bayes", trControl=ctrl, tuneGrid=tune_grid, metric="Accuracy")
+```
+The first classifier chosen was a **Multinomial Regression** classifier due to the 3-class nature of the problem, in contrast with **Logistic Regression**, which is thought to work best in binary classification scenarios. The selected implementation consists of only a single hyperparameter, `decay`, a value between 0 and 1 which works as a regularizer or "penalizer", aiming to reduce any possible overfitting in the data. Conveniently, `trainControl` stays in charge of trying different values for it and selecting the best fit. Results show a `decay` of 0.1 was best after iterating for three different values.
+
+```{r mnm}
+print(model_multinom)
+```
+
+The second classifier is a **Naive Bayes** classifier, chosen because of its simplicity. A `tuneGrid` was used to test it varying the values of two of its hyperparameters: `usekernel`, which if set to `TRUE`, uses a *kernel density estimation*, which is a method to estimate the distribution function of the data (on the contrary, a simpler distribution is assumed like a Gaussian), `laplace`, which acts as a correcting factor that aims to reduce the impact of certain values having 0 occurrences in the data, and finally, `adjust`, which adjusts the bandwidth of the kernel density and it was left at a fixed value of 1.
+
+Judging by the results, clearly the *kernel density estimation* is not working properly for this problem, so it is better to leave it set to `FALSE`, and *laplace smoothing* does not seem to have any effect on the training, maybe due to the reduced sparsity, so it is better left to 0. 
+
+```{r nb}
+print(model_nb)
+```
+### Statistical comparison between classifiers
+
+As a means to decide which classifier to use for the predictions, a statistical comparison between the two trained models will be performed. Both models were trained with a 10-fold cross-validation repeated 3 times. With help of the `resamples()` function, a comparative aggregation of the performance metrics (in this case accuracy) over the 30 different trainings for each model can be displayed.
+
+```{r resamps}
+resamps <- resamples(list(lr=model_multinom,nb=model_nb))
+summary(resamps)
+```
+
+Differences (each LR sample minus each NB sample) between all the samples are illustrated in the plot below. For most of them, the **multinomial LR classifier** shows better performance than **naive bayes**, nonetheless, a paired t-test will be carried out to determine whether such differences in performance are statistically significant or not.
+
+```{r plot-resamps}
+xyplot(resamps, what="BlandAltman")
+diffs <- diff(resamps)
+summary(diffs)
+```
+
+Again, since both models were trained on the same partitions with the same seeds an equal number of times, a *paired* t-test can be performed. The test returns `t=7.2306`, which following the t-distribution is associated with a p-value of 5.825e-08, an extremely low value compared to the threshold usually used to discard the null hypotesis (0.05 in this case). What this implies is that there is an alternative hypothesis: the algorithm with the best mean accuracy is significantly better, in this case **Multinomial Logistic Regression**.
+
+```{r t-test}
+t_test_results <- t.test(model_multinom$resample$Accuracy, model_nb$resample$Accuracy, paired=TRUE)
+t_test_results
+```
+### Making predictions
+
+Let us check the confusion matrix resulting from the test set predictions first, using the **Multinomial Regression** model. Sensitivity (also referred to as recall) illustrates the proportion of documents of a certain class that were correctly identified as belonging to that class. For these results, its values show the model struggles the most identifying examples of the neutral class which is probably explained by the variability and ambiguity of the class itself - the use of more infrequent terms can be expected the most in documents annotated as "neutral".
+
+However, in the case of specificity, even though the model is slightly less likely to correctly identify when documents do not pertain to the neutral class, all values for the three classes are pretty good.
+
+As a final highlight, the prevalence values indicate a minor class imbalance, presumably not very significative but still considerable enough to try some subsampling techniques and observe the results. This will be analyzed in the **Dealing with class imbalance** section.
+
+```{r test-predictions}
+test_predictions <- predict(model_multinom, newdata=test, type="raw")
+confusionMatrix(data=test_predictions, test$label)
+```
+
+In the spirit of a fun prediction exercise, a selection of reviews in Spanish were crafted and preprocessed (using the same previous model). The resulting predictions, including probabilities for each class label, appear to be notably accurate. This assessment can be done by anyone proficient in Spanish. However, it's worth noting a certain bias in the choice of words - model performance might be less consistent when faced with genuinely "real", unseen reviews.
+
+```{r experimental-predictions, warning=FALSE}
+# Vector of 5 sentences
+sentences <- c(
+  "Muy buen hotel, ubicación perfecta",
+  "La comida del restaurante fue deliciosa, sin embargo, las habitaciones dejan mucho que desear aparte de un mal servicio",
+  "Me gustó y repetiría. Bueno, bonito y barato. Desayunos excelentes.",
+  "El hotel está bien para estar de paso y por su ubicación, pero nada más.",
+  "Las habitaciones estaban limpias y cómodas."
+)
+
+# Prediction loop
+for (sentence in sentences) {
+  # Apply the custom preprocessing pipeline to a corpus object created from the sentence
+  corpus <- custom_preprocessing(Corpus(VectorSource(sentence)))
+  
+  # Create a DTM from the sentence and align dimensions with the one used for the model
+  examples <- DocumentTermMatrix(corpus, control=list(dictionary=Terms(reviews.dtm.94)))
+  
+  # Use the trained model to predict the label for the specific document
+  predicted_label <- predict(model_multinom, newdata=as.data.frame(as.matrix(examples)), type="prob")
+  
+  # Print the sentence along with its predicted label
+  print(sentence)
+  print(predicted_label)
+}
+```
+
+### Dealing with class imbalance
+
+There is no fixed consensus to when an uneven distribution of classes is a problem in training. Many data scientists suggest that a ratio as big as 1 to 10 amongst classes is high enough for the effect of imbalance adjusting algorithms actually benefitting the training and improving performance. Hence, in this case where the ratio is of 1 to 1.5 at most, little to no improvements are expected. Nonetheless, a upsampling will be applied, forcing all the classes to have as much documents as the majority class (negative), and training results will be again compared with the original using the MLR model.
+
+```{r imbalance}
+# original class distribution
+table(train$label)
+
+# plot original distribution
+barplot(table(train$label),
+        main = "Frequency of Labels",
+        xlab = "Label",
+        ylab = "Frequency",
+        col = "skyblue",
+        border = "black",
+        ylim = c(0, max(table(train$label)) * 1.1),  # Adjust ylim for better visualization
+        names.arg = names(table(train$label)))
+
+# subsampling
+set.seed(1234)
+up_train <- upSample(x=train[, -ncol(train)],  # take predictors and labels
+                     y=train$label) 
+table(up_train$Class)
+```
+
+Accuracy has improved around 4%. Let us perform a paired t-test once again to see how statistically significant can this upsampling improvement result.
+
+```{r retrain, message=FALSE, warning=FALSE, results='hide'}
+# Training 1st model with upsampled set
+subsamp_multinom <- train(Class ~ ., data=up_train, method="multinom", trControl=ctrl, metric="Accuracy")
+```
+```{r retrain-results}
+print(subsamp_multinom)
+```
+
+This time a p-value of 0.0008423 was obtained, falling well below the confidence interval, so the null hypotesis can be discarded again and the differences in the mean accuracies for both models can be taken as relevant. Although the improvement is little, it is still an improvement, and shows how something that might even seem dumb or naïve as it is duplicating samples until a balance between classes is reached, can enhance training, even in multi-class scenarios.
+
+```{r retrain-ttest}
+t_test_up_results <- t.test(subsamp_multinom$resample$Accuracy, model_multinom$resample$Accuracy, paired=TRUE)
+t_test_up_results
+```
+### Semi-supervised learning experiment
+
+In closing, a little semi-supervised learning (SSL) experiment will be conducted (using the upsampled set!) to illustrate how the results would be in case data was partially or even completely unnanotated. Would the model be able to equally discern between the three present classes? A simple **least squares** classifier following the **self-learning** approach was used for this trial. More details about its inner workings are described in the 2nd notebook of this course.
+
+```{r ssl}
+library(RSSL)
+
+# Define classifiers
+classifiers <- list(
+  "LeastSquaresClassifier"=function(X, y, X_u, y_u) {
+    LeastSquaresClassifier(X, y)
+  },
+  "Self"=function(X, y, X_u, y_u) {
+    SelfLearning(X, y, X_u, method=LeastSquaresClassifier)
+  }
+)
+
+# Define performance measures
+measures <- list("Accuracy"=measure_accuracy)
+
+# Assuming 'train' is your training dataset
+up_train_unlabeled <- up_train[, -ncol(up_train)]  # Remove the class label for unlabeled data
+
+# Create learning curve
+lc <- LearningCurveSSL(as.matrix(up_train_unlabeled), as.factor(up_train$Class),
+                       classifiers=classifiers,
+                       measures=measures,
+                       type="fraction",
+                       test_fraction=0.2,
+                       repeats=5)
+
+# Print learning curve
+plot(lc)
+```
+
+The output learning curve shows that the most proportion of labeled documents, the better performance is obtained in terms of accuracy. In this case, virtually both the plain **least squares** and the **self-learning** classifier obtain the same results, so as a SSL method it is not really contributing much. It can be concluded that such a classifier is not of any use in the event the original dataset partially lacked annotation data - its training takes up substantially more time and resources for little to no improvements compared to a classifier for supervised learning.
